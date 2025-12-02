@@ -1,0 +1,101 @@
+USE AT_CMDTS;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.sp_RefrescarTarjetasPendientes
+    @DiasAtras INT = 15  -- por defecto, 15 días hacia atrás
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @FechaDesde DATE;
+
+    -------------------------------------------------------------------
+    -- RANGO DE FECHAS
+    -------------------------------------------------------------------
+    -- Opción A (por defecto): usar días
+    SET @FechaDesde = DATEADD(DAY, -@DiasAtras, CAST(GETDATE() AS DATE));
+
+    -- Si querés probar por meses en vez de días, podés comentar la línea anterior
+    -- y usar una de estas:
+    --
+    -- 1 mes atrás:
+    -- SET @FechaDesde = DATEADD(MONTH, -1, CAST(GETDATE() AS DATE));
+    --
+    -- 2 meses atrás:
+    -- SET @FechaDesde = DATEADD(MONTH, -2, CAST(GETDATE() AS DATE));
+    --
+    -- 3 meses atrás:
+    -- SET @FechaDesde = DATEADD(MONTH, -3, CAST(GETDATE() AS DATE));
+
+    -------------------------------------------------------------------
+    -- OPCIONAL: LIMPIAR LA TABLA DESTINO ANTES DE CARGAR
+    -------------------------------------------------------------------
+    TRUNCATE TABLE dbo.TC_TarjetasPendientes;
+
+    -------------------------------------------------------------------
+    -- CTE DE EVENTOS (ENTREGA + ESTADOS FINALES)
+    -------------------------------------------------------------------
+    ;WITH EVT AS (
+        SELECT
+            E.DOCID,
+            -- Entrega reciente: evento 1 dentro del rango @FechaDesde
+            MAX(
+                CASE 
+                    WHEN E.EVTTDI = 1 
+                         AND /* REEMPLAZAR CON LA COLUMNA REAL DE FECHA DE EVENTO */
+                             E.FECHA_EVENTO >= @FechaDesde 
+                    THEN 1 
+                    ELSE 0 
+                END
+            ) AS TieneEntregaReciente,
+            -- Tiene algún evento final (activada / destruida / firmas varias)
+            MAX(
+                CASE 
+                    WHEN E.EVTTDI IN (16,19,70) THEN 1 
+                    ELSE 0 
+                END
+            ) AS TieneEstadoFinal
+        FROM LGLIB_LGMEVT E
+        WHERE E.EVTTDI IN (1,16,19,70)
+          -- Si tu tabla de eventos tiene una columna de fecha bien indexada,
+          -- podés incluso filtrar un poco acá para EVTTDI = 1:
+          -- AND (
+          --      (E.EVTTDI = 1 AND E.FECHA_EVENTO >= @FechaDesde)
+          --   OR (E.EVTTDI IN (16,19,70))
+          -- )
+        GROUP BY E.DOCID
+    )
+    INSERT INTO dbo.TC_TarjetasPendientes (ID_LOGISTICA, DOCID, FechaDesde, FechaEjecucion)
+    SELECT
+          A.ID_LOGISTICA
+        , C.DOCID
+        , @FechaDesde                 AS FechaDesde
+        , SYSUTCDATETIME()            AS FechaEjecucion  -- o GETDATE() si querés hora local
+    FROM CORPDW_V_R_SOL_ALTA_TC A
+    JOIN LGLIB_LGMDOC C
+        ON C.DOCID = A.ID_LOGISTICA
+    JOIN ODSP_LGLIB_LGMTDC T
+        ON  T.TDCPRI = C.DOCPRI
+        AND T.TDCID  = C.DOCTDI
+        AND (
+                (T.TDCPR  = 'TARJ.C' AND T.TDCID IN (1,36,37,70,89,116,132))
+             OR (T.TDCPRI = '105'    AND T.TDCID = 89)
+            )
+    JOIN EVT E
+        ON E.DOCID = A.ID_LOGISTICA
+    WHERE A.ID_LOGISTICA IS NOT NULL
+      -------------------------------------------------------------------
+      -- EXCLUIR GIFT CARD / GOURMET CARD
+      -------------------------------------------------------------------
+      AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GIFT CARD%'
+      AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GOURMET CARD%'
+      -------------------------------------------------------------------
+      -- SOLO TARJETAS ENTREGADAS RECIENTEMENTE Y SIN ESTADO FINAL
+      -------------------------------------------------------------------
+      AND E.TieneEntregaReciente = 1
+      AND E.TieneEstadoFinal     = 0;
+      -- Si querés limitar para pruebas, podés envolver el SELECT en un TOP:
+      -- INSERT INTO ... 
+      -- SELECT TOP (100) ...
+END;
+GO
