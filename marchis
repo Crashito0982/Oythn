@@ -28,14 +28,12 @@ BEGIN
     -- SET @FechaDesde = DATEADD(MONTH, -3, CAST(GETDATE() AS DATE));
 
     -------------------------------------------------------------------
-    -- OPCIONAL: LIMPIAR LA TABLA DESTINO ANTES DE CARGAR
+    -- LIMPIAR LA TABLA DESTINO
     -------------------------------------------------------------------
     TRUNCATE TABLE dbo.TC_TarjetasPendientes;
 
     -------------------------------------------------------------------
     -- CTE DE EVENTOS
-    -- - TieneEntregaReciente: EVTTDI = 1 dentro del rango @FechaDesde
-    -- - TieneEstadoFinal: cualquier EVTTDI IN (16,19,70), sin límite de fecha
     -------------------------------------------------------------------
     ;WITH EVT AS (
         SELECT
@@ -55,24 +53,21 @@ BEGIN
               ) AS TieneEstadoFinal
         FROM LGLIB_LGMEVT E
         WHERE E.EVTTDI IN (1,16,19,70)
-          -- Si quisieras reducir aún más lectura:
-          -- AND (
-          --        (E.EVTTDI = 1 AND E.EVTFCH >= @FechaDesde)  -- entregas recientes
-          --     OR (E.EVTTDI IN (16,19,70))                    -- estados finales, sin filtro de fecha
-          -- )
         GROUP BY E.DOCID
     )
     INSERT INTO dbo.TC_TarjetasPendientes (
           ID_LOGISTICA
         , DOCID
+        , NRO_CLIENTE       -- 👈 ahora lo cargamos
         , FechaDesde
         , FechaEjecucion
     )
     SELECT
           A.ID_LOGISTICA
         , C.DOCID
+        , A.NUMERO_CLIENTE  -- 👈 viene de CORPDW_V_R_SOL_ALTA_TC
         , @FechaDesde          AS FechaDesde
-        , SYSUTCDATETIME()     AS FechaEjecucion   -- o GETDATE() si querés hora local
+        , SYSUTCDATETIME()     AS FechaEjecucion
     FROM CORPDW_V_R_SOL_ALTA_TC A
     JOIN LGLIB_LGMDOC C
         ON C.DOCID = A.ID_LOGISTICA
@@ -86,16 +81,9 @@ BEGIN
     JOIN EVT E
         ON E.DOCID = A.ID_LOGISTICA
     WHERE A.ID_LOGISTICA IS NOT NULL
-      -------------------------------------------------------------------
-      -- EXCLUIR GIFT CARD / GOURMET CARD
-      -------------------------------------------------------------------
+      AND A.NUMERO_CLIENTE IS NOT NULL          -- 👈 para no violar NOT NULL
       AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GIFT CARD%'
       AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GOURMET CARD%'
-      -------------------------------------------------------------------
-      -- SOLO TARJETAS:
-      --   - ENTREGADAS RECIENTEMENTE (según EVTFCH y @FechaDesde)
-      --   - SIN NINGÚN EVENTO FINAL (16, 19, 70) EN SU HISTORIAL
-      -------------------------------------------------------------------
       AND E.TieneEntregaReciente = 1
       AND E.TieneEstadoFinal     = 0;
 END;
