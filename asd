@@ -100,3 +100,4 @@ BEGIN
       AND E.TieneEstadoFinal     = 0;
 END;
 GO
+"
