@@ -1,0 +1,232 @@
+import os
+from datetime import datetime
+
+import pandas as pd
+from sqlConn import sqlConn
+
+# ======================================================
+# CONFIGURACIÓN
+# ======================================================
+
+EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/Base_parametrica_modelo_boveda.xlsx"
+PREDEF_CONN = "AT_CMDTS"
+SCHEMA = "dbo"  # cambiar si usás otro schema
+
+
+# ======================================================
+# HELPERS
+# ======================================================
+
+def parse_num_latam(serie: pd.Series) -> pd.Series:
+    """
+    Convierte texto con formato latino a número.
+    - "" y "-" -> NULL
+    - "." de miles se elimina: 6.800 -> 6800
+    - "," decimal -> ".": 0,78 -> 0.78
+    Si la serie ya es numérica, solo intenta convertir.
+    """
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce")
+
+    s = serie.astype(str).str.strip()
+    s = s.replace({"": None, "-": None})
+    s = s.str.replace(".", "", regex=False)
+    s = s.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def limpiar_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - Strip a todos los VARCHAR
+    - "" / "-" / "NULL" (en cualquier caso) -> NULL
+    """
+    for col in df.select_dtypes(include=["object"]).columns:
+        def _clean(x):
+            if not isinstance(x, str):
+                return x
+            t = x.strip()
+            if t == "" or t == "-" or t.upper() == "NULL":
+                return None
+            return t
+
+        df[col] = df[col].apply(_clean)
+    return df
+
+
+def normalizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Quita espacios al inicio/fin de los encabezados.
+    """
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+# ======================================================
+# BovedaIndiceSucursales
+# -> PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_INDICE_SUCURSALES
+# ======================================================
+
+def cargar_boveda_indice_sucursales():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_INDICE_SUCURSALES"
+    hoja = "BovedaIndiceSucursales"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    df = normalizar_columnas(df)
+
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Columnas esperadas en el Excel / tabla destino:
+    # SUCURSALES (VARCHAR), INDICE (VARCHAR: 'OK' / 'NO'), OBS (VARCHAR), TRANSPORTADORA (VARCHAR)
+
+    # No se toca INDICE como número, porque contiene 'OK' / 'NO'
+    df = limpiar_strings(df)
+
+    columnas_finales = [
+        "SUCURSALES",
+        "INDICE",
+        "OBS",
+        "TRANSPORTADORA",
+    ]
+    df = df[columnas_finales]
+
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# BovedaATM
+# -> PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_ATM
+# ======================================================
+
+def cargar_boveda_atm():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_ATM"
+    hoja = "BovedaATM"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    df = normalizar_columnas(df)
+
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Columnas esperadas:
+    # LUNO (BIGINT), DENOMINACION_ATM (VARCHAR), PROVEEDOR (VARCHAR), DELEGACION (VARCHAR)
+
+    if "LUNO" in df.columns:
+        df["LUNO"] = parse_num_latam(df["LUNO"])
+
+    df = limpiar_strings(df)
+
+    columnas_finales = [
+        "LUNO",
+        "DENOMINACION_ATM",
+        "PROVEEDOR",
+        "DELEGACION",
+    ]
+    df = df[columnas_finales]
+
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# BovedaLimites
+# -> PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_LIMITES
+# ======================================================
+
+def cargar_boveda_limites():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_BOVEDA_LIMITES"
+    hoja = "BovedaLimites"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    df = normalizar_columnas(df)
+
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Columnas esperadas:
+    # TRANSPORTADORA (VARCHAR), DELEGACION (VARCHAR),
+    # MONTO (BIGINT), OBS (VARCHAR)
+
+    if "MONTO" in df.columns:
+        df["MONTO"] = parse_num_latam(df["MONTO"])
+
+    df = limpiar_strings(df)
+
+    columnas_finales = [
+        "TRANSPORTADORA",
+        "DELEGACION",
+        "MONTO",
+        "OBS",
+    ]
+    df = df[columnas_finales]
+
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# ORQUESTADOR
+# ======================================================
+
+def run():
+    if not os.path.isfile(EXCEL_PATH):
+        raise FileNotFoundError(f"No se encontró el Excel en: {EXCEL_PATH}")
+
+    print("Iniciando carga de Base Paramétrica Modelo Bóveda (TRUNCATE + APPEND)...")
+    cargar_boveda_indice_sucursales()
+    cargar_boveda_atm()
+    cargar_boveda_limites()
+    print("Proceso Base Paramétrica Modelo Bóveda finalizado.")
+
+
+if __name__ == "__main__":
+    run()
