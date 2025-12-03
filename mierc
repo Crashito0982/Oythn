@@ -1,0 +1,181 @@
+import pandas as pd
+from datetime import datetime
+from sqlConn import sqlConn
+
+PREDEF_CONN = "ODSPE"
+SCHEMA = "dbo"
+BASE_TABLE = "PLXS_BASE_PARAMETRICA_MODELO_ATM"
+HIST_TABLE = "PLXS_BASE_PARAMETRICA_MODELO_ATM_HIST"
+
+# Clave lógica (ajustá si fuese compuesta)
+KEY_COL = "ID"
+
+# Columnas que NO deben usarse para detectar cambios funcionales
+IGNORE_DIFF_COLS = {"INGRESADO", "FECHA_CIERRE"}
+
+def cargar_df(conn, table_name: str) -> pd.DataFrame:
+    """
+    Lee una tabla completa a DataFrame.
+    Ajustá 'conn.con' según cómo exponga la conexión tu clase sqlConn.
+    """
+    sql = f"SELECT * FROM {SCHEMA}.{table_name}"
+    # Si tu sqlConn expone otra cosa (por ejemplo .engine o .cnxn), ajustá acá:
+    return pd.read_sql(sql, conn.con)
+
+def detectar_cambios(df_actual: pd.DataFrame,
+                     df_hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    A partir de la tabla actual y la histórica, genera SOLO los nuevos registros
+    que deben agregarse a la tabla histórica.
+    No recalcula ESTADO_ATM acá, solo arma las filas nuevas con OBS_CAMBIO y FECHA_CAMBIO.
+    """
+    now_ts = pd.Timestamp.now()
+
+    # Si la tabla histórica está vacía, primer carga: todo es nuevo y vigente
+    if df_hist.empty:
+        df_nuevos = df_actual.copy()
+        df_nuevos["ESTADO_ATM"] = "VIGENTE"
+        df_nuevos["OBS_CAMBIO"] = "Carga inicial"
+        df_nuevos["FECHA_CAMBIO"] = now_ts
+        return df_nuevos
+
+    # Para la histórica, tomamos por ID el registro más reciente
+    df_hist = df_hist.copy()
+    # Usamos FECHA_CAMBIO si existe, sino INGRESADO como respaldo
+    df_hist["FECHA_REF"] = df_hist["FECHA_CAMBIO"].fillna(df_hist["INGRESADO"])
+    df_hist_sorted = df_hist.sort_values([KEY_COL, "FECHA_REF"])
+    df_hist_ult = df_hist_sorted.groupby(KEY_COL, as_index=False).tail(1)
+
+    # Merge actual vs último histórico por ID
+    merged = df_actual.merge(
+        df_hist_ult,
+        on=KEY_COL,
+        how="left",
+        suffixes=("_cur", "_prev"),
+        indicator=True
+    )
+
+    # Columnas a comparar (todas las de la tabla actual, menos las ignoradas)
+    base_cols = [c for c in df_actual.columns if c not in IGNORE_DIFF_COLS]
+
+    def columnas_cambiadas(row) -> list:
+        cambios = []
+        for col in base_cols:
+            val_cur = row.get(f"{col}_cur")
+            val_prev = row.get(f"{col}_prev")
+
+            # Consideramos NaN == NaN como "sin cambio"
+            if pd.isna(val_cur) and pd.isna(val_prev):
+                continue
+            if (pd.isna(val_cur) and not pd.isna(val_prev)) or \
+               (not pd.isna(val_cur) and pd.isna(val_prev)) or \
+               (val_cur != val_prev):
+                cambios.append(col)
+        return cambios
+
+    filas_nuevas = []
+
+    # 1) Registros totalmente nuevos (ID que no existía antes)
+    nuevos_ids = merged[merged["_merge"] == "left_only"]
+    for _, row in nuevos_ids.iterrows():
+        registro = {}
+        for col in df_actual.columns:
+            registro[col] = row[f"{col}_cur"]
+        registro["ESTADO_ATM"] = "VIGENTE"
+        registro["OBS_CAMBIO"] = "Nuevo registro"
+        registro["FECHA_CAMBIO"] = now_ts
+        filas_nuevas.append(registro)
+
+    # 2) Registros que ya existían (ID coincide), ver si cambiaron columnas
+    coinciden = merged[merged["_merge"] == "both"].copy()
+    coinciden["CAMBIOS"] = coinciden.apply(columnas_cambiadas, axis=1)
+
+    cambiados = coinciden[coinciden["CAMBIOS"].str.len() > 0]
+
+    for _, row in cambiados.iterrows():
+        registro = {}
+        for col in df_actual.columns:
+            registro[col] = row[f"{col}_cur"]
+        cols_cambiadas = row["CAMBIOS"]
+        obs = "Cambios en: " + ", ".join(cols_cambiadas)
+        registro["ESTADO_ATM"] = "VIGENTE"   # Despues recalculamos de nuevo para todos
+        registro["OBS_CAMBIO"] = obs
+        registro["FECHA_CAMBIO"] = now_ts
+        filas_nuevas.append(registro)
+
+    if not filas_nuevas:
+        # No hay cambios ni registros nuevos
+        return pd.DataFrame(columns=list(df_actual.columns) +
+                                      ["ESTADO_ATM", "OBS_CAMBIO", "FECHA_CAMBIO"])
+
+    df_nuevos = pd.DataFrame(filas_nuevas)
+    return df_nuevos
+
+def recalcular_estados(df_hist_total: pd.DataFrame) -> pd.DataFrame:
+    """
+    Dado TODO el histórico (viejo + nuevos), recalcula ESTADO_ATM:
+    - Para cada ID, el registro más reciente => VIGENTE
+    - El resto => ANTERIOR
+    """
+    df = df_hist_total.copy()
+
+    # Construimos una clave de fecha de referencia
+    df["FECHA_REF"] = df["FECHA_CAMBIO"].fillna(df["INGRESADO"])
+    df.sort_values([KEY_COL, "FECHA_REF"], inplace=True)
+
+    df["ESTADO_ATM"] = "ANTERIOR"
+    idx_ultimos = df.groupby(KEY_COL)["FECHA_REF"].idxmax()
+    df.loc[idx_ultimos, "ESTADO_ATM"] = "VIGENTE"
+
+    df.drop(columns=["FECHA_REF"], inplace=True)
+    return df
+
+def run_hist():
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+
+    try:
+        # 1) Leemos tabla actual y tabla histórica
+        df_actual = cargar_df(conn, BASE_TABLE)
+        try:
+            df_hist = cargar_df(conn, HIST_TABLE)
+        except Exception:
+            # Si la tabla todavía no existe o está vacía
+            df_hist = pd.DataFrame()
+
+        # 2) Detectamos qué filas nuevas hay que agregar al histórico
+        df_nuevos = detectar_cambios(df_actual, df_hist)
+
+        if df_nuevos.empty:
+            print("[HIST] No se detectaron cambios ni nuevos registros. No se modifica la tabla histórica.")
+            return
+
+        # 3) Unimos histórico viejo + registros nuevos
+        if df_hist.empty:
+            df_hist_total = df_nuevos
+        else:
+            df_hist_total = pd.concat([df_hist, df_nuevos], ignore_index=True)
+
+        # 4) Recalculamos ESTADO_ATM por ID
+        df_hist_total = recalcular_estados(df_hist_total)
+
+        # 5) TRUNCATE + INSERT de la tabla histórica
+        try:
+            conn.truncar_tabla(dataset_name=HIST_TABLE, schema=SCHEMA)
+            print(f"[{HIST_TABLE}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{HIST_TABLE}] WARNING en TRUNCATE: {e}")
+
+        conn.crea_tabla(df_hist_total, HIST_TABLE, if_exists="append")
+        print(f"[{HIST_TABLE}] Insertados {len(df_hist_total)} registros.")
+
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    # La idea seria:
+    # 1) Ejecutar primero tu run() que carga PLXS_BASE_PARAMETRICA_MODELO_ATM desde el CSV
+    # 2) Luego ejecutar run_hist() para actualizar la tabla histórica
+    run_hist()
