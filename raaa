@@ -1,0 +1,59 @@
+def run():
+    """
+    Script histórico para PLXS_BASE_PARAMETRICA_MODELO_ATM_HIST.
+    Pensado para ejecutarse después del vuelco diario de la tabla base.
+    """
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+
+    try:
+        # 1) Tabla actual (paramétrica diaria)
+        df_actual = cargar_df(conn, BASE_TABLE)
+
+        # 2) Ver si la tabla histórica existe
+        existe_hist = False
+        try:
+            if hasattr(conn, "table_exists"):
+                existe_hist = conn.table_exists(table=HIST_TABLE, schema=SCHEMA)
+        except Exception as e:
+            print(f"[{HIST_TABLE}] WARNING al verificar existencia de tabla:", e)
+            existe_hist = False
+
+        # 3) Tabla histórica (si existe)
+        if existe_hist:
+            df_hist = cargar_df(conn, HIST_TABLE)
+        else:
+            df_hist = pd.DataFrame()
+
+        # 4) Ver qué filas nuevas hay que agregar al histórico
+        df_nuevos = detectar_cambios(df_actual, df_hist)
+
+        if df_nuevos.empty:
+            print("[HIST] Sin cambios; no se modifica PLXS_BASE_PARAMETRICA_MODELO_ATM_HIST.")
+            return
+
+        # 5) Concatenar histórico viejo + nuevos
+        if df_hist.empty:
+            df_hist_total = df_nuevos
+        else:
+            df_hist_total = pd.concat([df_hist, df_nuevos], ignore_index=True)
+
+        # 6) Recalcular ESTADO_ATM por ID
+        df_hist_total = recalcular_estados(df_hist_total)
+
+        # 7) TRUNCATE + INSERT (porque en ODSPE no se quieren UPDATEs)
+        try:
+            if existe_hist:
+                conn.truncar_tabla(dataset_name=HIST_TABLE, schema=SCHEMA)
+                print(f"[{HIST_TABLE}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{HIST_TABLE}] WARNING en TRUNCATE:", e)
+
+        # crea_tabla debería crear la tabla si no existe
+        conn.crea_tabla(df_hist_total, HIST_TABLE, if_exists="append")
+        print(f"[{HIST_TABLE}] Insertados {len(df_hist_total)} registros en total.")
+
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
