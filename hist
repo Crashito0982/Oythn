@@ -1,0 +1,25 @@
+    # === 2c) IDs que desaparecieron en la tabla base (baja de ATM) ===
+    ids_hist = set(df_hist_ult[KEY_COL].unique())
+    ids_actual = set(df_actual[KEY_COL].unique())
+    ids_potenciales_baja = ids_hist - ids_actual
+
+    if ids_potenciales_baja:
+        df_baja_base = df_hist_ult[df_hist_ult[KEY_COL].isin(ids_potenciales_baja)].copy()
+
+        # Marcar cuáles de esos ya están dados de baja en su ÚLTIMO registro
+        df_baja_base["ES_BAJA"] = df_baja_base["OBS_CAMBIO"].fillna("").str.contains(
+            "Dado de baja", case=False, na=False
+        )
+
+        # Solo queremos generar baja para los que todavía NO tienen registro de baja
+        df_baja_nuevos = df_baja_base[~df_baja_base["ES_BAJA"]]
+
+        for _, row in df_baja_nuevos.iterrows():
+            registro = {}
+            # Copiamos los últimos valores conocidos de las columnas de negocio
+            for col in df_actual.columns:
+                registro[col] = row[col]
+            registro["ESTADO_ATM"] = "ANTERIOR"
+            registro["OBS_CAMBIO"] = "Dado de baja (ATM ya no figura en tabla base)"
+            registro["FECHA_CAMBIO"] = now_ts
+            filas_nuevas.append(registro)
