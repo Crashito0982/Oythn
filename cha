@@ -1,0 +1,276 @@
+USE AT_CMDTS;
+GO
+
+IF OBJECT_ID('dbo.TC_TarjetasPendientes', 'U') IS NOT NULL
+    DROP TABLE dbo.TC_TarjetasPendientes;
+GO
+
+CREATE TABLE dbo.TC_TarjetasPendientes (
+    ID_LOGISTICA                 BIGINT         NOT NULL,     -- DOCID logístico
+    FECHA_INGRESO_SOLICITUD      DATE           NULL,
+    NUMERO_CLIENTE               INT         NULL,
+    NUMERO_DOCUMENTO             VARCHAR(50)    NULL,         -- ajustá longitud
+    ESTADO_ACTIVACION            VARCHAR(50)    NULL,
+    TIPO_TARJETA                 VARCHAR(100)   NULL,         -- viene de TIPO_TARJETA_DESC
+    MES                          VARCHAR(15)    NULL,         -- 'NOVIEMBRE', 'DICIEMBRE', etc.
+    ANIO                         INT            NULL,         -- YEAR(FECHA_INGRESO_SOLICITUD)
+    CANALESPECIFICO              VARCHAR(150)   NULL,
+    CANALGENERAL                 VARCHAR(100)   NULL,
+    FECHA_ACTUALIZACION_REGISTRO DATETIME2(0)   NOT NULL,
+    CONSTRAINT PK_TC_TarjetasPendientes
+        PRIMARY KEY CLUSTERED (ID_LOGISTICA)
+);
+GO
+
+
+USE AT_CMDTS;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.sp_RefrescarTarjetasPendientes
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -------------------------------------------------------------------
+    -- 0) Fechas de corte: mes anterior completo + mes actual hasta hoy
+    -------------------------------------------------------------------
+    DECLARE @Hoy                    DATE         = CAST(GETDATE() AS DATE);
+    DECLARE @PrimerDiaMesActual     DATE         = DATEFROMPARTS(YEAR(@Hoy), MONTH(@Hoy), 1);
+    DECLARE @PrimerDiaMesAnterior   DATE         = DATEADD(MONTH, -1, @PrimerDiaMesActual);
+    DECLARE @FechaActualizacion     DATETIME2(0) = SYSUTCDATETIME();  -- o GETDATE() si querés local
+
+    -------------------------------------------------------------------
+    -- 1) Eventos: entrega (1) en el período y estados finales (16,19,70)
+    -------------------------------------------------------------------
+    ;WITH EVT AS (
+        SELECT
+              E.DOCID
+            , MAX(
+                CASE
+                    WHEN E.EVTTDI = 1
+                         AND E.EVTFCH >= @PrimerDiaMesAnterior
+                    THEN 1 ELSE 0
+                  END
+              ) AS TieneEntregaPeriodo
+            , MAX(
+                CASE
+                    WHEN E.EVTTDI IN (16,19,70)
+                    THEN 1 ELSE 0
+                  END
+              ) AS TieneEstadoFinal
+        FROM LGLIB_LGMEVT E
+        WHERE E.EVTTDI IN (1,16,19,70)
+        GROUP BY E.DOCID
+    ),
+
+    -------------------------------------------------------------------
+    -- 2) Plástico: sólo tarjetas con EMBPLAST = 'S'
+    -------------------------------------------------------------------
+    Plastico AS (
+        SELECT
+              PB.NUTARJET
+            , PB.EMBPLAST
+            , LEFT(TarjetaStr, LEN(TarjetaStr) - 3) AS DOCNRD_MATCH
+        FROM ODSP_TARJETA_PBTARJETA PB
+        CROSS APPLY (
+            SELECT LTRIM(RTRIM(CONVERT(VARCHAR(50), PB.NUTARJET))) AS TarjetaStr
+        ) X
+        WHERE PB.NUTARJET IS NOT NULL
+          AND LEN(X.TarjetaStr) > 3
+          AND PB.EMBPLAST = 'S'
+    ),
+
+    -------------------------------------------------------------------
+    -- 3) Canales: CANALESPECIFICO + CANALGENERAL (simplificado)
+    -------------------------------------------------------------------
+    CanalesRaw AS (
+        SELECT
+              A.DOCUMENTO_ID_DOC AS NRO_GUIA
+            , UPPER(
+                CASE
+                    WHEN UPPER(A.CANAL_VENTA_TARJETA) = 'MOBILE_RESPONSIVE'
+                         AND R.RETARRD IS NOT NULL
+                    THEN R.RETARRD
+                    ELSE A.CANAL_VENTA_TARJETA
+                END
+              ) AS CANALESPECIFICO
+            , ROW_NUMBER() OVER (
+                  PARTITION BY A.DOCUMENTO_ID_DOC
+                  ORDER BY E.EVTFCH DESC
+              ) AS rn
+        FROM CORPDW_V_LOGISTICA_DOC A
+        LEFT JOIN ODSP_LGLIB_LGMEVT E
+               ON E.DOCID = A.DOCUMENTO_ID_DOC
+        LEFT JOIN ODSP_LGLIB_LGMRET R
+               ON E.DOCID = R.RETID
+    ),
+    CanalesClasif AS (
+        SELECT
+              NRO_GUIA
+            , CANALESPECIFICO
+            , CASE
+                  WHEN CANALESPECIFICO LIKE '%CNB%'              THEN 'CNB'
+                  WHEN CANALESPECIFICO LIKE '%SUPERSEIS%'        THEN 'PAB S6'
+                  WHEN CANALESPECIFICO LIKE '%CASA CENTRAL%'     THEN 'AGENCIAS'
+                  WHEN CANALESPECIFICO LIKE '%CENTRO ENTREGAS%'  THEN 'AGENCIAS'
+                  WHEN CANALESPECIFICO LIKE '%AG.%'
+                    OR CANALESPECIFICO LIKE '%AGENCIA%'          THEN 'AGENCIAS'
+                  WHEN CANALESPECIFICO LIKE '%PERSONAL BANK%'    THEN 'PERSONAL BANK'
+                  WHEN CANALESPECIFICO LIKE '%TIGO%'             THEN 'TIGO'
+                  WHEN CANALESPECIFICO LIKE '%VOICENTER%'        THEN 'VOICENTER'
+                  WHEN CANALESPECIFICO LIKE '%STOCK%'            THEN 'PAB STOCK'
+                  WHEN CANALESPECIFICO LIKE '%PAGO SALARIO%'     THEN 'PGS AUTOMATICO'
+                  WHEN CANALESPECIFICO LIKE '%MOVIL%'
+                    OR CANALESPECIFICO LIKE '%MOBILE_RESPONSIVE%' THEN 'PGS AUTOMATICO'
+                  WHEN CANALESPECIFICO LIKE '%WEB_RESPONSIVE%'   THEN 'CUENTA DIGITAL'
+                  WHEN CANALESPECIFICO LIKE '%EMPRESARIAL%'      THEN 'EMPRESARIAL'
+                  WHEN CANALESPECIFICO LIKE '%JF COURIER%'       THEN 'JF COURIER'
+                  ELSE 'OTROS'
+              END AS CANALGENERAL
+        FROM CanalesRaw
+        WHERE rn = 1
+    ),
+
+    -------------------------------------------------------------------
+    -- 4) Dataset base (SourceData) para el MERGE
+    --    - Crédito + plástico + pendientes + ventana de 2 meses
+    -------------------------------------------------------------------
+    SourceData AS (
+        SELECT
+              A.ID_LOGISTICA
+            , A.FECHA_INGRESO_SOLICITUD
+            , A.NUMERO_CLIENTE
+            , A.NUMERO_DOCUMENTO
+            , A.ESTADO_ACTIVACION
+            , A.TIPO_TARJETA_DESC AS TIPO_TARJETA
+            , MES = CASE
+                        WHEN A.FECHA_INGRESO_SOLICITUD IS NULL THEN NULL
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 1  THEN 'ENERO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 2  THEN 'FEBRERO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 3  THEN 'MARZO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 4  THEN 'ABRIL'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 5  THEN 'MAYO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 6  THEN 'JUNIO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 7  THEN 'JULIO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 8  THEN 'AGOSTO'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 9  THEN 'SETIEMBRE'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 10 THEN 'OCTUBRE'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 11 THEN 'NOVIEMBRE'
+                        WHEN MONTH(A.FECHA_INGRESO_SOLICITUD) = 12 THEN 'DICIEMBRE'
+                    END
+            , ANIO = CASE
+                        WHEN A.FECHA_INGRESO_SOLICITUD IS NULL THEN NULL
+                        ELSE YEAR(A.FECHA_INGRESO_SOLICITUD)
+                     END
+            , CANALESPECIFICO = CC.CANALESPECIFICO
+            , CANALGENERAL    = CC.CANALGENERAL
+            , FECHA_ACTUALIZACION_REGISTRO = @FechaActualizacion
+        FROM CORPDW_V_R_SOL_ALTA_TC A
+        JOIN LGLIB_LGMDOC D
+             ON D.DOCID = A.ID_LOGISTICA
+        JOIN ODSP_LGLIB_LGMTDC TD
+             ON  TD.TDCPRI = D.DOCPRI
+             AND TD.TDCID  = D.DOCTDI
+             AND (
+                    (TD.TDCPRI = 'TARJ.C' AND TD.TDCID IN (1,36,37,70,89,116,132))
+                  OR (TD.TDCPRI = '105'    AND TD.TDCID = 89)
+                 )
+        JOIN EVT E
+             ON E.DOCID = A.ID_LOGISTICA
+        JOIN Plastico P
+             ON LTRIM(RTRIM(D.DOCNRD)) = P.DOCNRD_MATCH
+        LEFT JOIN ACTIVACIONES_TC_PENDIENTES AP
+             ON AP.NRO_GUIA = CAST(A.ID_LOGISTICA AS VARCHAR(50))
+        LEFT JOIN CanalesClasif CC
+             ON CC.NRO_GUIA = A.ID_LOGISTICA
+        WHERE A.ID_LOGISTICA IS NOT NULL
+          -- no repetir lo que ya está en ACTIVACIONES_TC_PENDIENTES
+          AND AP.NRO_GUIA IS NULL
+          -- excluir BAJA DEFINITIVA al momento de armar el dataset
+          AND (A.SITUACION_TC IS NULL OR A.SITUACION_TC <> 'BAJA DEFINITIVA')
+          -- ventana de 2 meses: mes anterior completo + mes actual hasta hoy
+          AND A.FECHA_INGRESO_SOLICITUD >= @PrimerDiaMesAnterior
+          AND A.FECHA_INGRESO_SOLICITUD <= @Hoy
+          -- entregadas en el período y sin evento final
+          AND E.TieneEntregaPeriodo = 1
+          AND E.TieneEstadoFinal    = 0
+          -- excluir GIFT / GOURMET / PREPAGA
+          AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GIFT CARD%'
+          AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'GOURMET CARD%'
+          AND COALESCE(A.CANA_VENTA_TJT_DESC,'') NOT LIKE 'PREPAGA%'
+    )
+
+    -------------------------------------------------------------------
+    -- 5) MERGE: actúa SOLO sobre el período en revisión (2 meses)
+    -------------------------------------------------------------------
+    MERGE dbo.TC_TarjetasPendientes AS T
+    USING SourceData                AS S
+        ON T.ID_LOGISTICA = S.ID_LOGISTICA
+
+    WHEN MATCHED THEN
+        UPDATE SET
+              T.FECHA_INGRESO_SOLICITUD       = S.FECHA_INGRESO_SOLICITUD
+            , T.NUMERO_CLIENTE                = S.NUMERO_CLIENTE
+            , T.NUMERO_DOCUMENTO              = S.NUMERO_DOCUMENTO
+            , T.ESTADO_ACTIVACION            = S.ESTADO_ACTIVACION
+            , T.TIPO_TARJETA                 = S.TIPO_TARJETA
+            , T.MES                          = S.MES
+            , T.ANIO                         = S.ANIO
+            , T.CANALESPECIFICO              = S.CANALESPECIFICO
+            , T.CANALGENERAL                 = S.CANALGENERAL
+            , T.FECHA_ACTUALIZACION_REGISTRO = S.FECHA_ACTUALIZACION_REGISTRO
+
+    WHEN NOT MATCHED BY TARGET THEN
+        INSERT (
+              ID_LOGISTICA
+            , FECHA_INGRESO_SOLICITUD
+            , NUMERO_CLIENTE
+            , NUMERO_DOCUMENTO
+            , ESTADO_ACTIVACION
+            , TIPO_TARJETA
+            , MES
+            , ANIO
+            , CANALESPECIFICO
+            , CANALGENERAL
+            , FECHA_ACTUALIZACION_REGISTRO
+        )
+        VALUES (
+              S.ID_LOGISTICA
+            , S.FECHA_INGRESO_SOLICITUD
+            , S.NUMERO_CLIENTE
+            , S.NUMERO_DOCUMENTO
+            , S.ESTADO_ACTIVACION
+            , S.TIPO_TARJETA
+            , S.MES
+            , S.ANIO
+            , S.CANALESPECIFICO
+            , S.CANALGENERAL
+            , S.FECHA_ACTUALIZACION_REGISTRO
+        )
+
+    WHEN NOT MATCHED BY SOURCE
+         AND T.FECHA_INGRESO_SOLICITUD >= @PrimerDiaMesAnterior
+    THEN
+        -- solo limpiamos el período en revisión (no tocamos meses históricos)
+        DELETE;
+
+    -------------------------------------------------------------------
+    -- 6) Limpieza global:
+    --    borrar de la tabla FINAL cualquier tarjeta que YA NO esté pendiente
+    --    porque:
+    --      - tiene evento 16,19 o 70 en LGMEVT
+    --      - o su SITUACION_TC pasó a 'BAJA DEFINITIVA'
+    -------------------------------------------------------------------
+    DELETE T
+    FROM dbo.TC_TarjetasPendientes T
+    LEFT JOIN CORPDW_V_R_SOL_ALTA_TC A
+           ON A.ID_LOGISTICA = T.ID_LOGISTICA
+    WHERE EXISTS (
+              SELECT 1
+              FROM LGLIB_LGMEVT E
+              WHERE E.DOCID  = T.ID_LOGISTICA
+                AND E.EVTTDI IN (16,19,70)
+          )
+       OR A.SITUACION_TC = 'BAJA DEFINITIVA';
+END;
+GO
