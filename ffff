@@ -66,11 +66,12 @@ BEGIN
               A.DOCUMENTO_ID_DOC AS NRO_GUIA
             , UPPER(
                 CASE
-                    WHEN UPPER(A.CANAL_VENTA_TARJETA COLLATE DATABASE_DEFAULT) = 'MOBILE_RESPONSIVE'
+                    WHEN UPPER(A.CANAL_VENTA_TARJETA COLLATE Modern_Spanish_CI_AS) 
+                         = 'MOBILE_RESPONSIVE' COLLATE Modern_Spanish_CI_AS
                          AND R.RETARRD IS NOT NULL
-                    THEN R.RETARRD
-                    ELSE A.CANAL_VENTA_TARJETA
-                END COLLATE DATABASE_DEFAULT
+                    THEN R.RETARRD COLLATE Modern_Spanish_CI_AS
+                    ELSE A.CANAL_VENTA_TARJETA COLLATE Modern_Spanish_CI_AS
+                END
               ) AS CANALESPECIFICO
             , ROW_NUMBER() OVER (
                   PARTITION BY A.DOCUMENTO_ID_DOC
@@ -82,6 +83,7 @@ BEGIN
         LEFT JOIN ODSP_LGLIB_LGMRET R
                ON E.DOCID = R.RETID
     ),
+
 
     -------------------------------------------------------------------
     -- 4) CANALES_CLASIFICADOS: CANALESPECIFICO + CANALGENERAL
