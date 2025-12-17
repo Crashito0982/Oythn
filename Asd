@@ -30,7 +30,7 @@ def cargar_df(conn, table_name: str) -> pd.DataFrame:
 def set_fechas_nuevos(df: pd.DataFrame, now_ts: pd.Timestamp) -> pd.DataFrame:
     """
     Para los registros NUEVOS que vamos a insertar en el histórico:
-      - INGRESADO  = fecha/hora actual (corrida del script)
+      - INGRESADO   = fecha/hora actual (corrida del script)
       - FECHA_CIERRE = último día del mes de now_ts
     """
     if df.empty:
@@ -60,6 +60,8 @@ def detectar_cambios(df_actual: pd.DataFrame, df_hist: pd.DataFrame) -> pd.DataF
       - IDs existentes con alguna columna distinta: OBS_CAMBIO = 'Cambios en: ...'.
       - IDs que estaban en histórico pero no están en la tabla actual:
             OBS_CAMBIO = 'Dado de baja (ATM ya no figura en tabla base)'.
+      - IDs que estaban de baja y vuelven a aparecer:
+            OBS_CAMBIO = 'Reactivación de ATM (...) [con o sin Cambios en: ...]'.
     """
     now_ts = pd.Timestamp.now()
 
@@ -126,6 +128,15 @@ def detectar_cambios(df_actual: pd.DataFrame, df_hist: pd.DataFrame) -> pd.DataF
                 cambios.append(col)
         return cambios
 
+    # Marcamos cuáles registros son "reactivaciones":
+    # ID que estaba dado de baja en el último histórico y vuelve a aparecer en la base.
+    merged["ES_REACTIVACION"] = (
+        (merged["_merge"] == "both") &
+        merged.get("OBS_CAMBIO_prev", "").fillna("").str.contains(
+            "Dado de baja", case=False, na=False
+        )
+    )
+
     filas_nuevas = []
 
     # === 2a) IDs nuevos (solo en tabla actual) ===
@@ -140,8 +151,30 @@ def detectar_cambios(df_actual: pd.DataFrame, df_hist: pd.DataFrame) -> pd.DataF
         registro["FECHA_CAMBIO"] = now_ts
         filas_nuevas.append(registro)
 
-    # === 2b) IDs que ya existían: ver si alguna columna cambió ===
-    coinciden = merged[merged["_merge"] == "both"].copy()
+    # === 2b) IDs que ya existían: ver si hubo reactivaciones o cambios ===
+
+    # 2b-1) Reactivaciones: último registro histórico era "Dado de baja"
+    reactivados = merged[merged["ES_REACTIVACION"]].copy()
+    reactivados["CAMBIOS"] = reactivados.apply(columnas_cambiadas, axis=1)
+
+    for _, row in reactivados.iterrows():
+        registro = {}
+        for col in df_actual.columns:
+            registro[col] = row.get(col, row.get(f"{col}_cur", pd.NA))
+
+        cols_cambiadas = row["CAMBIOS"]
+        if cols_cambiadas:
+            obs = "Reactivación de ATM (estaba dado de baja). Cambios en: " + ", ".join(cols_cambiadas)
+        else:
+            obs = "Reactivación de ATM (estaba dado de baja)"
+
+        registro["ESTADO_ATM"] = "VIGENTE"
+        registro["OBS_CAMBIO"] = obs
+        registro["FECHA_CAMBIO"] = now_ts
+        filas_nuevas.append(registro)
+
+    # 2b-2) Cambios normales (IDs que NO son reactivaciones)
+    coinciden = merged[(merged["_merge"] == "both") & (~merged["ES_REACTIVACION"])].copy()
     coinciden["CAMBIOS"] = coinciden.apply(columnas_cambiadas, axis=1)
 
     cambiados = coinciden[coinciden["CAMBIOS"].apply(len) > 0]
