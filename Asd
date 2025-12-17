@@ -1,12 +1,25 @@
-    # Marcamos cuáles registros son "reactivaciones":
-    # ID que estaba dado de baja en el último histórico y vuelve a aparecer en la base.
-    if "OBS_CAMBIO_prev" in merged.columns:
-        obs_prev = merged["OBS_CAMBIO_prev"].fillna("")
+    # === Marcar reactivaciones ===
+    # 1) IDs cuyo ÚLTIMO registro histórico es una baja
+    if "OBS_CAMBIO" in df_hist_ult.columns:
+        ids_baja_hist = set(
+            df_hist_ult.loc[
+                df_hist_ult["OBS_CAMBIO"].fillna("").str.contains(
+                    "Dado de baja", case=False, na=False
+                ),
+                KEY_COL,
+            ].unique()
+        )
     else:
-        # Si la columna no existe (por histórico viejo), creamos una serie vacía
-        obs_prev = pd.Series("", index=merged.index)
+        ids_baja_hist = set()
 
+    # 2) IDs actualmente presentes en la tabla base
+    ids_actual = set(df_actual[KEY_COL].unique())
+
+    # 3) IDs que estaban dados de baja y ahora reaparecen en la base
+    ids_reactivados = ids_actual & ids_baja_hist
+
+    # 4) Marcamos en el merged cuáles filas son reactivaciones
     merged["ES_REACTIVACION"] = (
         (merged["_merge"] == "both") &
-        obs_prev.str.contains("Dado de baja", case=False, na=False)
+        (merged[KEY_COL].isin(ids_reactivados))
     )
