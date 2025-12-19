@@ -32,7 +32,7 @@ Lógica general:
         columnas de negocio -> nueva fila VIGENTE con OBS_CAMBIO
         "Cambios en: ..."
       * Bajas: claves que existían en histórico y ya no están en la base
-        -> nueva fila ANTWERIOR con OBS_CAMBIO "Dado de baja (...)".
+        -> nueva fila ANTERIOR con OBS_CAMBIO "Dado de baja (...)".
 
   - Recalculo de ESTADO_REGISTRO:
       * Para cada clave lógica, se toma la(s) fila(s) con la mayor
@@ -41,6 +41,9 @@ Lógica general:
         quedan ANTERIOR.
       * Si no es baja, todas las filas de la última versión quedan
         VIGENTE y el resto ANTERIOR.
+
+Se añadieron manejos especiales para claves que contienen NULL/NaN,
+para evitar falsos "baja" y reactivaciones cuando hay columnas nulas.
 """
 
 # ======================================================
@@ -91,27 +94,62 @@ IGNORE_DIFF_COLS = {"FECHA_CREACION"}
 # ======================================================
 
 
+def normalize_key_values(values):
+    """Devuelve una tupla donde NaN/NaT se reemplazan por None.
+
+    Esto permite que las claves con NULL se comparen de forma estable
+    entre la tabla base y la histórica.
+    """
+
+    out = []
+    for v in values:
+        if pd.isna(v):
+            out.append(None)
+        else:
+            out.append(v)
+    return tuple(out)
+
+
 def cargar_df(conn: sqlConn, table_name: str) -> pd.DataFrame:
     """Trae una tabla completa como DataFrame usando sqlConn.descarga_tabla."""
+
     return conn.descarga_tabla(nombre_base=table_name, schema=SCHEMA)
 
 
 def key_tuple_from_row(row: pd.Series, key_cols, suffix: str = ""):
-    """Construye la clave lógica (tuple o valor simple) desde una fila."""
+    """Construye la clave lógica (tuple o valor simple) desde una fila.
+
+    Normaliza valores nulos a None para poder compararlos en sets.
+    """
+
     if len(key_cols) == 1:
-        return row.get(key_cols[0] + suffix, row.get(key_cols[0]))
-    return tuple(row.get(col + suffix, row.get(col)) for col in key_cols)
+        val = row.get(key_cols[0] + suffix, row.get(key_cols[0]))
+        return None if pd.isna(val) else val
+
+    vals = []
+    for col in key_cols:
+        val = row.get(col + suffix, row.get(col))
+        vals.append(val)
+    return normalize_key_values(vals)
 
 
 def build_key_set(df: pd.DataFrame, key_cols):
-    """Devuelve el conjunto de claves lógicas presentes en un DataFrame."""
+    """Devuelve el conjunto de claves lógicas presentes en un DataFrame.
+
+    No descarta filas con NULL en la clave; las normaliza a None para
+    que sean comparables entre sí.
+    """
+
     if df.empty:
         return set()
 
     if len(key_cols) == 1:
-        return set(df[key_cols[0]].dropna().unique())
+        return set(None if pd.isna(v) else v for v in df[key_cols[0]].tolist())
 
-    return set(tuple(r) for r in df[key_cols].dropna().itertuples(index=False, name=None))
+    res = set()
+    for row in df[key_cols].itertuples(index=False, name=None):
+        res.add(normalize_key_values(row))
+    return res
 
 
 def detectar_cambios_generico(
@@ -126,6 +164,8 @@ def detectar_cambios_generico(
     """Calcula las filas nuevas que deben insertarse en la tabla histórica.
 
     Maneja altas, cambios, bajas y reactivaciones.
+    Se corrigió el manejo de claves con valores NULL para evitar
+    falsos positivos de baja/cambio.
     """
 
     ignore_diff_cols = set(ignore_diff_cols or set())
@@ -149,11 +189,11 @@ def detectar_cambios_generico(
 
     # fallback: si no hay FECHA_CAMBIO, usamos FECHA_CREACION
     if "FECHA_CREACION" in df_hist.columns:
-        mask = df_hist["FECHA_REF"].isna()
-        df_hist.loc[mask, "FECHA_REF"] = df_hist.loc[mask, "FECHA_CREACION"]
+        mask_ref = df_hist["FECHA_REF"].isna()
+        df_hist.loc[mask_ref, "FECHA_REF"] = df_hist.loc[mask_ref, "FECHA_CREACION"]
 
     df_hist_sorted = df_hist.sort_values(list(key_cols) + ["FECHA_REF"])
-    df_hist_ult = df_hist_sorted.groupby(list(key_cols), as_index=False).tail(1)
+    df_hist_ult = df_hist_sorted.groupby(list(key_cols), dropna=False).tail(1)
 
     # Merge actual vs última versión histórica
     merged = df_actual.merge(
@@ -195,17 +235,22 @@ def detectar_cambios_generico(
 
         return cambios
 
-    # IDs cuya última versión está dada de baja
+    # IDs cuya última versión está dada de baja (con clave normalizada)
     if "OBS_CAMBIO" in df_hist_ult.columns:
         mask_baja = df_hist_ult["OBS_CAMBIO"].fillna("").str.contains(
             r"^\s*Dado de baja\b", case=False, na=False, regex=True
         )
         if len(key_cols) == 1:
-            ids_baja_hist = set(df_hist_ult.loc[mask_baja, key_cols[0]].unique())
+            ids_baja_hist = set(
+                None if pd.isna(v) else v
+                for v in df_hist_ult.loc[mask_baja, key_cols[0]].tolist()
+            )
         else:
             ids_baja_hist = set(
-                tuple(row[col] for col in key_cols)
-                for _, row in df_hist_ult.loc[mask_baja, key_cols].iterrows()
+                normalize_key_values(row)
+                for row in df_hist_ult.loc[mask_baja, key_cols].itertuples(
+                    index=False, name=None
+                )
             )
     else:
         ids_baja_hist = set()
@@ -273,11 +318,13 @@ def detectar_cambios_generico(
 
     # 2d) Bajas: claves que estaban en el histórico y ya no están en la tabla base
     if len(key_cols) == 1:
-        ids_hist = set(df_hist_ult[key_cols[0]].unique())
+        ids_hist = set(
+            None if pd.isna(v) else v for v in df_hist_ult[key_cols[0]].tolist()
+        )
     else:
         ids_hist = set(
-            tuple(row[col] for col in key_cols)
-            for _, row in df_hist_ult[key_cols].iterrows()
+            normalize_key_values(row)
+            for row in df_hist_ult[key_cols].itertuples(index=False, name=None)
         )
 
     ids_pot_baja = ids_hist - ids_actual
@@ -289,11 +336,7 @@ def detectar_cambios_generico(
         )
 
         def key_in_pot(row: pd.Series) -> bool:
-            if len(key_cols) == 1:
-                key = row[key_cols[0]]
-            else:
-                key = tuple(row[col] for col in key_cols)
-            return key in ids_pot_baja
+            return key_tuple_from_row(row, key_cols, "") in ids_pot_baja
 
         df_baja_base = df_baja_base[df_baja_base.apply(key_in_pot, axis=1)]
         df_baja_nuevos = df_baja_base[~df_baja_base["ES_BAJA"]]
@@ -309,7 +352,9 @@ def detectar_cambios_generico(
 
     if not filas_nuevas:
         # Nada que agregar en esta corrida
-        return pd.DataFrame(columns=list(df_actual.columns) + [status_col, "OBS_CAMBIO", "FECHA_CAMBIO"])
+        return pd.DataFrame(
+            columns=list(df_actual.columns) + [status_col, "OBS_CAMBIO", "FECHA_CAMBIO"]
+        )
 
     return pd.DataFrame(filas_nuevas)
 
@@ -332,8 +377,7 @@ def recalcular_estados_generico(
         => todas las filas de la última versión quedan VIGENTE y el resto
            de esa clave queda ANTERIOR.
 
-    Esto permite que, por ejemplo, en la carga inicial con duplicados, todas
-    las filas de la única versión existente queden VIGENTE.
+    Se corrigió el groupby para que no ignore claves con NULL (dropna=False).
     """
 
     df = df_hist_total.copy()
@@ -345,26 +389,30 @@ def recalcular_estados_generico(
         df["FECHA_REF"] = pd.NaT
 
     if "FECHA_CREACION" in df.columns:
-        mask = df["FECHA_REF"].isna()
-        df.loc[mask, "FECHA_REF"] = df.loc[mask, "FECHA_CREACION"]
+        mask_ref = df["FECHA_REF"].isna()
+        df.loc[mask_ref, "FECHA_REF"] = df.loc[mask_ref, "FECHA_CREACION"]
 
     # Ordenamos por clave y FECHA_REF para prolijidad
     df.sort_values(list(key_cols) + ["FECHA_REF"], inplace=True)
 
-    # FECHA_REF máxima por clave
-    df["MAX_FECHA_REF"] = df.groupby(list(key_cols))["FECHA_REF"].transform("max")
+    # FECHA_REF máxima por clave (incluyendo claves con NULL)
+    df["MAX_FECHA_REF"] = df.groupby(list(key_cols), dropna=False)["FECHA_REF"].transform(
+        "max"
+    )
 
     # Marca: esta fila pertenece a la "última versión" de su clave
     df["ES_ULTIMA_VERSION"] = df["FECHA_REF"] == df["MAX_FECHA_REF"]
 
-    # Clave interna para no depender de apply con slices de columnas
+    # Clave interna normalizada para no depender de NaN vs NaN
     if len(key_cols) == 1:
-        df["_KEY_"] = df[key_cols[0]]
+        df["_KEY_"] = df[key_cols[0]].apply(lambda v: None if pd.isna(v) else v)
     else:
-        df["_KEY_"] = list(zip(*(df[col] for col in key_cols)))
+        df["_KEY_"] = [
+            normalize_key_values(row) for row in df[key_cols].itertuples(index=False, name=None)
+        ]
 
     # Filas de última versión
-    ultimas = df[df["ES_ULTIMA_VERSION"]].copy()
+    ultimas = df[df["ES_ULTIMA_VERSION"].copy()]
     ultimas["ES_BAJA"] = ultimas["OBS_CAMBIO"].fillna("").str.contains(
         r"^\s*Dado de baja\b", case=False, na=False, regex=True
     )
